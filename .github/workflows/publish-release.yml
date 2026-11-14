@@ -37,12 +37,13 @@ jobs:
           MP4_PATH=$(find ./art -type f -name '*.mp4' | head -n 1)
           test -n "$MP4_PATH"
           cp "$MP4_PATH" ./out/crush-island-10min-silent.mp4
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           ffprobe -v error -show_entries format=duration,size,bit_rate -show_entries stream=codec_name,width,height,r_frame_rate,nb_frames -of default=noprint_wrappers=1 ./out/crush-island-10min-silent.mp4
           SIZE_BYTES=$(stat -c%s ./out/crush-island-10min-silent.mp4)
           echo "Original size: $SIZE_BYTES bytes"
           if [ "$SIZE_BYTES" -gt 800000000 ]; then
             ffmpeg -y -i ./out/crush-island-10min-silent.mp4 \
-              -c:v libx264 -preset medium -crf 17 -pix_fmt yuv420p -movflags +faststart \
+              -c:v libx264 -preset fast -crf 17 -pix_fmt yuv420p -movflags +faststart \
               ./out/crush-island-10min-silent-crf17.mp4
             ls -lh ./out/
           fi
