@@ -1,0 +1,48 @@
+name: Transcode Drive Copy
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag with crush-island-10min-silent.mp4'
+        required: true
+        default: 'v1.0-crush-island-10min'
+
+permissions:
+  contents: write
+
+jobs:
+  transcode:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Download silent master from Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p out
+          gh release download "${{ github.event.inputs.tag }}" \
+            -R "${{ github.repository }}" \
+            -p "crush-island-10min-silent.mp4" \
+            -D ./out
+          ls -lh ./out/
+
+      - name: Transcode crisp 1080p@30fps <=140MB stream for Composio Drive upload
+        run: |
+          ffmpeg -y -i ./out/crush-island-10min-silent.mp4 \
+            -c:v libx264 -preset faster -crf 24 -maxrate 1800k -bufsize 3600k \
+            -pix_fmt yuv420p -movflags +faststart \
+            ./out/crush-island-10min-silent-drive.mp4
+          ls -lh ./out/crush-island-10min-silent-drive.mp4
+          ffprobe -v error -show_entries format=duration,size,bit_rate -show_entries stream=codec_name,width,height,r_frame_rate,nb_frames -of default=noprint_wrappers=1 ./out/crush-island-10min-silent-drive.mp4
+
+      - name: Upload Drive-ready silent asset to Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.inputs.tag }}" \
+            ./out/crush-island-10min-silent-drive.mp4 \
+            -R "${{ github.repository }}" \
+            --clobber
