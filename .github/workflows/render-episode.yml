@@ -1,0 +1,131 @@
+name: Free 20-Runner Episode Render
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Episode slug under public/episodes/
+        required: true
+        default: crush-island-10min
+      workers:
+        description: Number of parallel Linux runners (max 20 concurrent free)
+        required: true
+        default: '20'
+      concurrency:
+        description: Chromium tabs per runner
+        required: true
+        default: '3'
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.calc.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack engine source if packaged
+        run: |
+          if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
+      - name: Partition total frames across parallel runners
+        id: calc
+        run: |
+          python3 - <<'PY'
+          import json, math, os
+          slug = "${{ inputs.slug }}"
+          n = int("${{ inputs.workers }}")
+          ep = json.load(open(f"public/episodes/{slug}/episode.json"))
+          tm = json.load(open(f"public/episodes/{slug}/timing.json"))
+          total = max(1, math.ceil(tm["total"] * (ep.get("fps") or 30)))
+          step = math.ceil(total / n)
+          chunks = []
+          for idx in range(n):
+              a = idx * step
+              b = min(total - 1, (idx + 1) * step - 1)
+              if a <= b:
+                  chunks.append({"idx": f"{idx:02d}", "start": a, "end": b})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write("matrix=" + json.dumps(chunks) + "\n")
+          print(f"Planned {total} frames across {len(chunks)} runners")
+          PY
+
+  render_chunk:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        chunk: ${{ fromJson(needs.plan.outputs.matrix) }}
+    env:
+      REMOTION_GL: swangle
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack engine source
+        run: |
+          if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Ensure ffmpeg + browser dependencies
+        run: |
+          CHROME_BIN=$(command -v google-chrome || command -v chromium || true)
+          echo "Detected browser: ${CHROME_BIN:-none (will use remotion chrome-for-testing)}"
+          if [ -n "$CHROME_BIN" ]; then
+            echo "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true" >> "$GITHUB_ENV"
+            echo "REMOTION_CHROME_EXECUTABLE=$CHROME_BIN" >> "$GITHUB_ENV"
+          fi
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg libgbm1 libnss3
+          fi
+      - name: Install Node dependencies & patch Remotion WebGL2 capture
+        run: |
+          npm ci --force --no-audit --no-fund
+          node tools/patch-remotion.cjs
+          if [ -z "${REMOTION_CHROME_EXECUTABLE:-}" ]; then
+            npx remotion browser ensure --chrome-mode=chrome-for-testing
+          fi
+      - name: Render frame slice ${{ matrix.chunk.start }}-${{ matrix.chunk.end }}
+        run: |
+          node tools/build-episode.mjs "${{ inputs.slug }}" \
+            --frames=${{ matrix.chunk.start }}-${{ matrix.chunk.end }} \
+            --concurrency=${{ inputs.concurrency }} \
+            --no-audio --force
+          mv "out/${{ inputs.slug }}/video.mp4" "chunk-${{ matrix.chunk.idx }}.mp4"
+          ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames,width,height -of default=nw=1 "chunk-${{ matrix.chunk.idx }}.mp4"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk.idx }}
+          path: chunk-${{ matrix.chunk.idx }}.mp4
+          retention-days: 3
+
+  stitch:
+    needs: render_chunk
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: chunks
+          pattern: chunk-*
+          merge-multiple: true
+      - name: Stitch 20 silent 1080p MP4 chunks
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          COUNT=$(ls chunks/chunk-*.mp4 | wc -l)
+          echo "Downloaded chunk count: $COUNT"
+          test "$COUNT" -gt 0
+          for f in $(ls chunks/chunk-*.mp4 | sort); do
+            echo "file '$PWD/$f'" >> list.txt
+          done
+          ffmpeg -y -v error -f concat -safe 0 -i list.txt -c copy "${{ inputs.slug }}-silent.mp4"
+          ls -lh "${{ inputs.slug }}-silent.mp4"
+          ffprobe -v error -show_entries format=duration -show_entries stream=width,height,r_frame_rate -of default=nw=1 "${{ inputs.slug }}-silent.mp4"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}-silent-video
+          path: ${{ inputs.slug }}-silent.mp4
+          retention-days: 5
