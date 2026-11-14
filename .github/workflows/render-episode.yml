@@ -104,13 +104,18 @@ jobs:
   stitch:
     needs: render_chunk
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: chunks
           pattern: chunk-*
           merge-multiple: true
-      - name: Stitch 20 silent 1080p MP4 chunks
+      - name: Stitch 20 silent 1080p MP4 chunks & transcode Drive stream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
@@ -122,8 +127,16 @@ jobs:
             echo "file '$PWD/$f'" >> list.txt
           done
           ffmpeg -y -v error -f concat -safe 0 -i list.txt -c copy "${{ inputs.slug }}-silent.mp4"
-          ls -lh "${{ inputs.slug }}-silent.mp4"
+          ffmpeg -y -v error -i "${{ inputs.slug }}-silent.mp4" \
+            -c:v libx264 -preset faster -crf 24 -maxrate 1800k -bufsize 3600k -pix_fmt yuv420p -movflags +faststart \
+            "${{ inputs.slug }}-drive-silent.mp4"
+          ls -lh "${{ inputs.slug }}-silent.mp4" "${{ inputs.slug }}-drive-silent.mp4"
           ffprobe -v error -show_entries format=duration -show_entries stream=width,height,r_frame_rate -of default=nw=1 "${{ inputs.slug }}-silent.mp4"
+          TAG="v2.0-${{ inputs.slug }}-action"
+          gh release create "$TAG" "${{ inputs.slug }}-silent.mp4" "${{ inputs.slug }}-drive-silent.mp4" \
+            --title "Action Render: ${{ inputs.slug }}" \
+            --notes "20-runner 1080p 30fps choreographed action render" || \
+          gh release upload "$TAG" "${{ inputs.slug }}-silent.mp4" "${{ inputs.slug }}-drive-silent.mp4" --clobber
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.slug }}-silent-video
