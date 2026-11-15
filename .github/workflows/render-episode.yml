@@ -14,29 +14,33 @@ on:
       concurrency:
         description: Chromium tabs per runner
         required: true
-        default: '3'
+        default: '4'
+      max_frames:
+        description: Maximum frames to render (2700 = 90s Director Cut)
+        required: false
+        default: '2700'
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.calc.outputs.matrix }}
-      rmatrix: ${{ steps.calc.outputs.rmatrix }}
     steps:
       - uses: actions/checkout@v4
       - name: Unpack engine source if packaged
         run: |
           if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
-      - name: Partition total frames across parallel runners
+      - name: Partition frames across parallel runners
         id: calc
         run: |
           python3 - <<'PY'
           import json, math, os
           slug = "${{ inputs.slug }}"
           n = int("${{ inputs.workers }}")
+          max_f = int("${{ inputs.max_frames }}" or "2700")
           ep = json.load(open(f"public/episodes/{slug}/episode.json"))
           tm = json.load(open(f"public/episodes/{slug}/timing.json"))
-          total = max(1, math.ceil(tm["total"] * (ep.get("fps") or 30)))
+          total = min(max_f, max(1, math.ceil(tm["total"] * (ep.get("fps") or 30))))
           step = math.ceil(total / n)
           chunks = []
           for idx in range(n):
@@ -44,124 +48,15 @@ jobs:
               b = min(total - 1, (idx + 1) * step - 1)
               if a <= b:
                   chunks.append({"idx": f"{idx:02d}", "start": a, "end": b})
-          nshots = len(tm["shots"])
-          rstep = math.ceil(nshots / 4)
-          rchunks = []
-          for ridx in range(4):
-              sa = ridx * rstep
-              sb = min(nshots - 1, (ridx + 1) * rstep - 1)
-              if sa <= sb:
-                  rchunks.append({"idx": f"{ridx:02d}", "s0": sa, "s1": sb})
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("matrix=" + json.dumps(chunks) + "\n")
-              fh.write("rmatrix=" + json.dumps(rchunks) + "\n")
-          print(f"Planned {total} frames across {len(chunks)} runners + {len(rchunks)} review runners")
+          print(f"Planned {total} frames across {len(chunks)} runners")
           PY
-
-  review_slice:
-    needs: plan
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        rchunk: ${{ fromJson(needs.plan.outputs.rmatrix) }}
-    env:
-      REMOTION_GL: swangle
-      STILLS_CONCURRENCY: '4'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Unpack engine source
-        run: |
-          if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-      - name: Ensure browser + dependencies
-        run: |
-          CHROME_BIN=$(command -v google-chrome || command -v chromium || true)
-          if [ -n "$CHROME_BIN" ]; then
-            echo "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true" >> "$GITHUB_ENV"
-            echo "REMOTION_CHROME_EXECUTABLE=$CHROME_BIN" >> "$GITHUB_ENV"
-          fi
-          npm ci --force --no-audit --no-fund
-          node tools/patch-remotion.cjs
-          if [ -z "${REMOTION_CHROME_EXECUTABLE:-}" ]; then
-            npx remotion browser ensure --chrome-mode=chrome-for-testing
-          fi
-      - name: Render review strip stills for shots ${{ matrix.rchunk.s0 }}-${{ matrix.rchunk.s1 }}
-        run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
-          const { spawnSync } = require('child_process');
-          const slug = "${{ inputs.slug }}";
-          const s0 = ${{ matrix.rchunk.s0 }}, s1 = ${{ matrix.rchunk.s1 }};
-          const tm = JSON.parse(fs.readFileSync(`public/episodes/${slug}/timing.json`, 'utf8'));
-          const fps = tm.fps || 30;
-          const STRIP = [0, 0.3, 0.65, 0.93];
-          const stripT = s => STRIP.map(k => (k === 0 ? Math.min(0.04, s.dur / 2) : s.dur * k));
-          const frameAt = (shot, t) => {
-            const s = tm.shots[shot];
-            const f0 = Math.round(s.start * fps), f1 = Math.round((s.start + s.dur) * fps) - 1;
-            return Math.max(f0, Math.min(f1, f0 + Math.round(t * fps)));
-          };
-          const jobs = [];
-          for (let i = s0; i <= s1; i++) {
-            stripT(tm.shots[i]).forEach((t, j) => {
-              jobs.push({
-                out: `../${slug}/review/raw/shot_${String(i).padStart(3, '0')}_${'abcd'[j]}`,
-                id: 'Episode',
-                props: { slug, review: true },
-                frame: frameAt(i, t),
-              });
-            });
-          }
-          fs.mkdirSync(`out/${slug}/review/raw`, { recursive: true });
-          fs.writeFileSync(`out/${slug}/review/slice_jobs.json`, JSON.stringify(jobs));
-          const r = spawnSync('node', ['tools/stills.cjs', `out/${slug}/review/slice_jobs.json`], { stdio: 'inherit' });
-          if (r.status !== 0) process.exit(r.status || 1);
-          NODE
-          tar -czf "review-cache-${{ matrix.rchunk.idx }}.tar.gz" -C out .stills_cache
-      - uses: actions/upload-artifact@v4
-        with:
-          name: review-cache-${{ matrix.rchunk.idx }}
-          path: review-cache-${{ matrix.rchunk.idx }}.tar.gz
-          retention-days: 3
-
-  review_pack:
-    needs: review_slice
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: rcache
-          pattern: review-cache-*
-          merge-multiple: true
-      - name: Merge review cache and publish to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p merged
-          for f in rcache/review-cache-*.tar.gz; do
-            tar -xzf "$f" -C merged
-          done
-          tar -czf "${{ inputs.slug }}-stills-cache.tar.gz" -C merged .stills_cache
-          ls -lh "${{ inputs.slug }}-stills-cache.tar.gz"
-          TAG="v2.0-${{ inputs.slug }}-action"
-          gh release create "$TAG" "${{ inputs.slug }}-stills-cache.tar.gz" \
-            --title "Action Render: ${{ inputs.slug }}" \
-            --notes "20-runner 1080p 30fps choreographed action render" || \
-          gh release upload "$TAG" "${{ inputs.slug }}-stills-cache.tar.gz" --clobber
 
   render_chunk:
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 20
@@ -181,7 +76,6 @@ jobs:
       - name: Ensure ffmpeg + browser dependencies
         run: |
           CHROME_BIN=$(command -v google-chrome || command -v chromium || true)
-          echo "Detected browser: ${CHROME_BIN:-none (will use remotion chrome-for-testing)}"
           if [ -n "$CHROME_BIN" ]; then
             echo "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true" >> "$GITHUB_ENV"
             echo "REMOTION_CHROME_EXECUTABLE=$CHROME_BIN" >> "$GITHUB_ENV"
@@ -207,9 +101,9 @@ jobs:
           ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames,width,height -of default=nw=1 "chunk-${{ matrix.chunk.idx }}.mp4"
       - uses: actions/upload-artifact@v4
         with:
-          name: chunk-${{ matrix.chunk.idx }}
+          name: chunk90-${{ matrix.chunk.idx }}
           path: chunk-${{ matrix.chunk.idx }}.mp4
-          retention-days: 3
+          retention-days: 2
 
   stitch:
     needs: render_chunk
@@ -221,34 +115,25 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: chunks
-          pattern: chunk-*
+          pattern: chunk90-*
           merge-multiple: true
-      - name: Stitch 20 silent 1080p MP4 chunks & transcode Drive stream
+      - name: Stitch 20 silent 1080p MP4 chunks & publish 90s release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if ! command -v ffmpeg >/dev/null 2>&1; then
             sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           fi
-          COUNT=$(ls chunks/chunk-*.mp4 | wc -l)
-          echo "Downloaded chunk count: $COUNT"
-          test "$COUNT" -gt 0
           for f in $(ls chunks/chunk-*.mp4 | sort); do
             echo "file '$PWD/$f'" >> list.txt
           done
-          ffmpeg -y -v error -f concat -safe 0 -i list.txt -c copy "${{ inputs.slug }}-silent.mp4"
-          ffmpeg -y -v error -i "${{ inputs.slug }}-silent.mp4" \
-            -c:v libx264 -preset faster -crf 24 -maxrate 1800k -bufsize 3600k -pix_fmt yuv420p -movflags +faststart \
-            "${{ inputs.slug }}-drive-silent.mp4"
-          ls -lh "${{ inputs.slug }}-silent.mp4" "${{ inputs.slug }}-drive-silent.mp4"
-          ffprobe -v error -show_entries format=duration -show_entries stream=width,height,r_frame_rate -of default=nw=1 "${{ inputs.slug }}-silent.mp4"
-          TAG="v2.0-${{ inputs.slug }}-action"
-          gh release create "$TAG" "${{ inputs.slug }}-silent.mp4" "${{ inputs.slug }}-drive-silent.mp4" \
-            --title "Action Render: ${{ inputs.slug }}" \
-            --notes "20-runner 1080p 30fps choreographed action render" || \
-          gh release upload "$TAG" "${{ inputs.slug }}-silent.mp4" "${{ inputs.slug }}-drive-silent.mp4" --clobber
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.slug }}-silent-video
-          path: ${{ inputs.slug }}-silent.mp4
-          retention-days: 5
+          ffmpeg -y -v error -f concat -safe 0 -i list.txt \
+            -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p -movflags +faststart \
+            "Crush_Island_Director_Cut_90s_silent.mp4"
+          ls -lh "Crush_Island_Director_Cut_90s_silent.mp4"
+          ffprobe -v error -show_entries format=duration -show_entries stream=width,height,r_frame_rate -of default=nw=1 "Crush_Island_Director_Cut_90s_silent.mp4"
+          TAG="v3.0-${{ inputs.slug }}-90s"
+          gh release create "$TAG" "Crush_Island_Director_Cut_90s_silent.mp4" \
+            --title "90s Director Cut: ${{ inputs.slug }}" \
+            --notes "20-runner 1080p 30fps 90s Director Cut" || \
+          gh release upload "$TAG" "Crush_Island_Director_Cut_90s_silent.mp4" --clobber
