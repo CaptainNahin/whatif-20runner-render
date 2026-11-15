@@ -21,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.calc.outputs.matrix }}
+      rmatrix: ${{ steps.calc.outputs.rmatrix }}
     steps:
       - uses: actions/checkout@v4
       - name: Unpack engine source if packaged
@@ -43,10 +44,119 @@ jobs:
               b = min(total - 1, (idx + 1) * step - 1)
               if a <= b:
                   chunks.append({"idx": f"{idx:02d}", "start": a, "end": b})
+          nshots = len(tm["shots"])
+          rstep = math.ceil(nshots / 4)
+          rchunks = []
+          for ridx in range(4):
+              sa = ridx * rstep
+              sb = min(nshots - 1, (ridx + 1) * rstep - 1)
+              if sa <= sb:
+                  rchunks.append({"idx": f"{ridx:02d}", "s0": sa, "s1": sb})
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("matrix=" + json.dumps(chunks) + "\n")
-          print(f"Planned {total} frames across {len(chunks)} runners")
+              fh.write("rmatrix=" + json.dumps(rchunks) + "\n")
+          print(f"Planned {total} frames across {len(chunks)} runners + {len(rchunks)} review runners")
           PY
+
+  review_slice:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        rchunk: ${{ fromJson(needs.plan.outputs.rmatrix) }}
+    env:
+      REMOTION_GL: swangle
+      STILLS_CONCURRENCY: '4'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Unpack engine source
+        run: |
+          if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+      - name: Ensure browser + dependencies
+        run: |
+          CHROME_BIN=$(command -v google-chrome || command -v chromium || true)
+          if [ -n "$CHROME_BIN" ]; then
+            echo "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true" >> "$GITHUB_ENV"
+            echo "REMOTION_CHROME_EXECUTABLE=$CHROME_BIN" >> "$GITHUB_ENV"
+          fi
+          npm ci --force --no-audit --no-fund
+          node tools/patch-remotion.cjs
+          if [ -z "${REMOTION_CHROME_EXECUTABLE:-}" ]; then
+            npx remotion browser ensure --chrome-mode=chrome-for-testing
+          fi
+      - name: Render review strip stills for shots ${{ matrix.rchunk.s0 }}-${{ matrix.rchunk.s1 }}
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const { spawnSync } = require('child_process');
+          const slug = "${{ inputs.slug }}";
+          const s0 = ${{ matrix.rchunk.s0 }}, s1 = ${{ matrix.rchunk.s1 }};
+          const tm = JSON.parse(fs.readFileSync(`public/episodes/${slug}/timing.json`, 'utf8'));
+          const fps = tm.fps || 30;
+          const STRIP = [0, 0.3, 0.65, 0.93];
+          const stripT = s => STRIP.map(k => (k === 0 ? Math.min(0.04, s.dur / 2) : s.dur * k));
+          const frameAt = (shot, t) => {
+            const s = tm.shots[shot];
+            const f0 = Math.round(s.start * fps), f1 = Math.round((s.start + s.dur) * fps) - 1;
+            return Math.max(f0, Math.min(f1, f0 + Math.round(t * fps)));
+          };
+          const jobs = [];
+          for (let i = s0; i <= s1; i++) {
+            stripT(tm.shots[i]).forEach((t, j) => {
+              jobs.push({
+                out: `../${slug}/review/raw/shot_${String(i).padStart(3, '0')}_${'abcd'[j]}`,
+                id: 'Episode',
+                props: { slug, review: true },
+                frame: frameAt(i, t),
+              });
+            });
+          }
+          fs.mkdirSync(`out/${slug}/review/raw`, { recursive: true });
+          fs.writeFileSync(`out/${slug}/review/slice_jobs.json`, JSON.stringify(jobs));
+          const r = spawnSync('node', ['tools/stills.cjs', `out/${slug}/review/slice_jobs.json`], { stdio: 'inherit' });
+          if (r.status !== 0) process.exit(r.status || 1);
+          NODE
+          tar -czf "review-cache-${{ matrix.rchunk.idx }}.tar.gz" -C out .stills_cache
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-cache-${{ matrix.rchunk.idx }}
+          path: review-cache-${{ matrix.rchunk.idx }}.tar.gz
+          retention-days: 3
+
+  review_pack:
+    needs: review_slice
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: rcache
+          pattern: review-cache-*
+          merge-multiple: true
+      - name: Merge review cache and publish to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p merged
+          for f in rcache/review-cache-*.tar.gz; do
+            tar -xzf "$f" -C merged
+          done
+          tar -czf "${{ inputs.slug }}-stills-cache.tar.gz" -C merged .stills_cache
+          ls -lh "${{ inputs.slug }}-stills-cache.tar.gz"
+          TAG="v2.0-${{ inputs.slug }}-action"
+          gh release create "$TAG" "${{ inputs.slug }}-stills-cache.tar.gz" \
+            --title "Action Render: ${{ inputs.slug }}" \
+            --notes "20-runner 1080p 30fps choreographed action render" || \
+          gh release upload "$TAG" "${{ inputs.slug }}-stills-cache.tar.gz" --clobber
 
   render_chunk:
     needs: plan
