@@ -67,9 +67,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Install EDStudio npm dependencies
+      - name: Install EDStudio npm dependencies & ensure ffmpeg
         run: |
-          npm install --ignore-scripts --no-audit --no-fund
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          fi
+          npm install --no-audit --no-fund
       - name: Render 12-Frame Toy-Like + Hyper-Builder Proof Sheet on chunk 00
         if: matrix.chunk.idx == '00' && inputs.duration_sec == '90'
         run: |
@@ -96,6 +100,7 @@ jobs:
               [11:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v11];\
               [v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11]xstack=inputs=12:layout=0_0|450_0|900_0|1350_0|0_800|450_800|900_800|1350_800|0_1600|450_1600|900_1600|1350_1600[out]" \
             -map "[out]" -frames:v 1 EDStudio_ToyLike_HyperBuilder_Proof.png
+          ls -lh EDStudio_ToyLike_HyperBuilder_Proof.png
       - uses: actions/upload-artifact@v4
         if: matrix.chunk.idx == '00' && inputs.duration_sec == '90'
         with:
@@ -108,7 +113,8 @@ jobs:
             --from "${{ matrix.chunk.t0 }}" \
             --to "${{ matrix.chunk.t1 }}" \
             --out "chunk-${{ matrix.chunk.idx }}.mp4"
-          ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames,width,height -of default=nw=1 "chunk-${{ matrix.chunk.idx }}.mp4"
+          ls -lh "chunk-${{ matrix.chunk.idx }}.mp4"
+          test -s "chunk-${{ matrix.chunk.idx }}.mp4"
       - uses: actions/upload-artifact@v4
         with:
           name: edchunk-${{ matrix.chunk.idx }}
@@ -137,6 +143,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ffmpeg
+          fi
           ls -lh chunks/
           > concat.txt
           for f in $(ls chunks/chunk-*.mp4 | sort); do
