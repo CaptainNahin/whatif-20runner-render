@@ -4,21 +4,21 @@ on:
   workflow_dispatch:
     inputs:
       slug:
-        description: Episode slug under public/episodes/
+        description: Episode folder under videos/
         required: true
-        default: crush-island-10min
+        default: 087-crush-island-10min
       workers:
-        description: Number of parallel Linux runners (max 20 concurrent free)
+        description: Number of parallel Linux runners (20 concurrent)
         required: true
         default: '20'
-      concurrency:
-        description: Chromium tabs per runner
+      duration_sec:
+        description: Duration in seconds to render (90 for vertical slice, 620.433 for full 10-min movie)
         required: true
-        default: '4'
-      max_frames:
-        description: Maximum frames to render (2700 = 90s Director Cut)
-        required: false
-        default: '2700'
+        default: '90'
+      release_tag:
+        description: GitHub Release tag for outputs
+        required: true
+        default: v4.0-edstudio-90s
 
 jobs:
   plan:
@@ -27,30 +27,27 @@ jobs:
       matrix: ${{ steps.calc.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-      - name: Unpack engine source if packaged
-        run: |
-          if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
-      - name: Partition frames across parallel runners
+      - name: Partition duration across 20 parallel runners
         id: calc
         run: |
           python3 - <<'PY'
-          import json, math, os
-          slug = "${{ inputs.slug }}"
+          import json, os
           n = int("${{ inputs.workers }}")
-          max_f = int("${{ inputs.max_frames }}" or "2700")
-          ep = json.load(open(f"public/episodes/{slug}/episode.json"))
-          tm = json.load(open(f"public/episodes/{slug}/timing.json"))
-          total = min(max_f, max(1, math.ceil(tm["total"] * (ep.get("fps") or 30))))
-          step = math.ceil(total / n)
+          dur = float("${{ inputs.duration_sec }}")
+          fps = 30
+          total_frames = int(round(dur * fps))
+          frames_per_worker = (total_frames + n - 1) // n
           chunks = []
           for idx in range(n):
-              a = idx * step
-              b = min(total - 1, (idx + 1) * step - 1)
-              if a <= b:
-                  chunks.append({"idx": f"{idx:02d}", "start": a, "end": b})
+              f0 = idx * frames_per_worker
+              f1 = min(total_frames, (idx + 1) * frames_per_worker)
+              if f0 < f1:
+                  t0 = round(f0 / fps, 4)
+                  t1 = round(f1 / fps, 4)
+                  chunks.append({"idx": f"{idx:02d}", "t0": str(t0), "t1": str(t1)})
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write("matrix=" + json.dumps(chunks) + "\n")
-          print(f"Planned {total} frames across {len(chunks)} runners")
+          print(f"Planned {dur}s ({total_frames} frames) across {len(chunks)} runners")
           PY
 
   render_chunk:
@@ -62,46 +59,59 @@ jobs:
       max-parallel: 20
       matrix:
         chunk: ${{ fromJson(needs.plan.outputs.matrix) }}
-    env:
-      REMOTION_GL: swangle
     steps:
       - uses: actions/checkout@v4
-      - name: Unpack engine source
+      - name: Unpack EDStudio engine source
         run: |
-          if [ -f engine_src.tar.gz ]; then tar -xzf engine_src.tar.gz; fi
+          tar -xzf engine_src.tar.gz
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-      - name: Ensure ffmpeg + browser dependencies
+      - name: Install EDStudio npm dependencies
         run: |
-          CHROME_BIN=$(command -v google-chrome || command -v chromium || true)
-          if [ -n "$CHROME_BIN" ]; then
-            echo "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true" >> "$GITHUB_ENV"
-            echo "REMOTION_CHROME_EXECUTABLE=$CHROME_BIN" >> "$GITHUB_ENV"
-          fi
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends ffmpeg libgbm1 libnss3
-          fi
-      - name: Install Node dependencies & patch Remotion WebGL2 capture
+          npm install --ignore-scripts --no-audit --no-fund
+      - name: Render 12-Frame Toy-Like + Hyper-Builder Proof Sheet on chunk 00
+        if: matrix.chunk.idx == '00' && inputs.duration_sec == '90'
         run: |
-          npm ci --force --no-audit --no-fund
-          node tools/patch-remotion.cjs
-          if [ -z "${REMOTION_CHROME_EXECUTABLE:-}" ]; then
-            npx remotion browser ensure --chrome-mode=chrome-for-testing
-          fi
-      - name: Render frame slice ${{ matrix.chunk.start }}-${{ matrix.chunk.end }}
+          node tools/render.mjs "${{ inputs.slug }}" \
+            --stills 4.2,9.0,19.0,26.5,86.0,101.5,120.0,148.5,244.8,289.0,368.5,486.0 --full
+          STILL_DIR="videos/${{ inputs.slug }}/stills"
+          ls -la "$STILL_DIR"
+          ffmpeg -y -v error \
+            -i "$STILL_DIR/t004.20.jpg" -i "$STILL_DIR/t009.00.jpg" -i "$STILL_DIR/t019.00.jpg" -i "$STILL_DIR/t026.50.jpg" \
+            -i "$STILL_DIR/t086.00.jpg" -i "$STILL_DIR/t101.50.jpg" -i "$STILL_DIR/t120.00.jpg" -i "$STILL_DIR/t148.50.jpg" \
+            -i "$STILL_DIR/t244.80.jpg" -i "$STILL_DIR/t289.00.jpg" -i "$STILL_DIR/t368.50.jpg" -i "$STILL_DIR/t486.00.jpg" \
+            -filter_complex "\
+              [0:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v0];\
+              [1:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v1];\
+              [2:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v2];\
+              [3:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v3];\
+              [4:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v4];\
+              [5:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v5];\
+              [6:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v6];\
+              [7:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v7];\
+              [8:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v8];\
+              [9:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v9];\
+              [10:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v10];\
+              [11:v]scale=450:800,drawbox=x=0:y=0:w=450:h=800:color=white@0.25:t=2[v11];\
+              [v0][v1][v2][v3][v4][v5][v6][v7][v8][v9][v10][v11]xstack=inputs=12:layout=0_0|450_0|900_0|1350_0|0_800|450_800|900_800|1350_800|0_1600|450_1600|900_1600|1350_1600[out]" \
+            -map "[out]" -frames:v 1 EDStudio_ToyLike_HyperBuilder_Proof.png
+      - uses: actions/upload-artifact@v4
+        if: matrix.chunk.idx == '00' && inputs.duration_sec == '90'
+        with:
+          name: edstudio-proof-sheet
+          path: EDStudio_ToyLike_HyperBuilder_Proof.png
+          retention-days: 2
+      - name: Render time slice ${{ matrix.chunk.t0 }}s-${{ matrix.chunk.t1 }}s
         run: |
-          node tools/build-episode.mjs "${{ inputs.slug }}" \
-            --frames=${{ matrix.chunk.start }}-${{ matrix.chunk.end }} \
-            --concurrency=${{ inputs.concurrency }} \
-            --no-audio --force
-          mv "out/${{ inputs.slug }}/video.mp4" "chunk-${{ matrix.chunk.idx }}.mp4"
+          node tools/render.mjs "${{ inputs.slug }}" \
+            --from "${{ matrix.chunk.t0 }}" \
+            --to "${{ matrix.chunk.t1 }}" \
+            --out "chunk-${{ matrix.chunk.idx }}.mp4"
           ffprobe -v error -count_frames -select_streams v:0 -show_entries stream=nb_read_frames,width,height -of default=nw=1 "chunk-${{ matrix.chunk.idx }}.mp4"
       - uses: actions/upload-artifact@v4
         with:
-          name: chunk90-${{ matrix.chunk.idx }}
+          name: edchunk-${{ matrix.chunk.idx }}
           path: chunk-${{ matrix.chunk.idx }}.mp4
           retention-days: 2
 
@@ -115,25 +125,30 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: chunks
-          pattern: chunk90-*
+          pattern: edchunk-*
           merge-multiple: true
-      - name: Stitch 20 silent 1080p MP4 chunks & publish 90s release
+      - uses: actions/download-artifact@v4
+        if: inputs.duration_sec == '90'
+        continue-on-error: true
+        with:
+          name: edstudio-proof-sheet
+          path: chunks
+      - name: Stitch 20 silent MP4 chunks & publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if ! command -v ffmpeg >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
-          fi
+          ls -lh chunks/
+          > concat.txt
           for f in $(ls chunks/chunk-*.mp4 | sort); do
-            echo "file '$PWD/$f'" >> list.txt
+            echo "file '$PWD/$f'" >> concat.txt
           done
-          ffmpeg -y -v error -f concat -safe 0 -i list.txt \
-            -c:v libx264 -preset fast -crf 20 -pix_fmt yuv420p -movflags +faststart \
-            "Crush_Island_Director_Cut_90s_silent.mp4"
-          ls -lh "Crush_Island_Director_Cut_90s_silent.mp4"
-          ffprobe -v error -show_entries format=duration -show_entries stream=width,height,r_frame_rate -of default=nw=1 "Crush_Island_Director_Cut_90s_silent.mp4"
-          TAG="v3.0-${{ inputs.slug }}-90s"
-          gh release create "$TAG" "Crush_Island_Director_Cut_90s_silent.mp4" \
-            --title "90s Director Cut: ${{ inputs.slug }}" \
-            --notes "20-runner 1080p 30fps 90s Director Cut" || \
-          gh release upload "$TAG" "Crush_Island_Director_Cut_90s_silent.mp4" --clobber
+          OUT_MP4="EDStudio_Silent_${{ inputs.release_tag }}.mp4"
+          ffmpeg -y -f concat -safe 0 -i concat.txt -c copy -movflags +faststart "$OUT_MP4"
+          ls -lh "$OUT_MP4"
+          TAG="${{ inputs.release_tag }}"
+          gh release delete "$TAG" -y || true
+          if [ -f chunks/EDStudio_ToyLike_HyperBuilder_Proof.png ]; then
+            gh release create "$TAG" "$OUT_MP4" chunks/EDStudio_ToyLike_HyperBuilder_Proof.png --title "EDStudio Render $TAG" --notes "20-runner parallel EDStudio render"
+          else
+            gh release create "$TAG" "$OUT_MP4" --title "EDStudio Render $TAG" --notes "20-runner parallel EDStudio render"
+          fi
